@@ -9,9 +9,6 @@ from sklearn.metrics import mean_squared_error
 from google.cloud import storage
 import os
 import matplotlib.pyplot as plt
-# from sklearn.preprocessing import RobustScaler
-# from sklearn.ensemble import RandomForestRegressor
-# from sklearn.feature_selection import RFE
 import schedule
 import datetime
 import time
@@ -40,135 +37,146 @@ def run_LSTM():
         df['Date'] = pd.to_datetime(df['Date'], format='%m/%d/%Y')
         df.set_index('Date', inplace=True)
 
-        # One-hot encode 'wind_dir' on the TRAINING data, preserving all categories
+        # One-hot encode 'wind_dir'
         df = pd.get_dummies(df, columns=['wind_dir'], prefix='wind_dir')
-
-        # Get the list of all one-hot encoded wind direction columns from the training data
         all_wind_dir_columns = [col for col in df.columns if col.startswith('wind_dir_')]
 
         # Initial set of features (including one-hot encoded wind directions)
-        all_features = ['traffic','temperature', 'humidity', 'wind_speed', 'pressure', 'precip', 'visibility',
+        all_features = ['traffic', 'temperature', 'humidity', 'wind_speed', 'pressure', 'precip', 'visibility',
                         'Canada', 'Central America', 'USA', 'Coal', 'Natural Gas', 'Other', 'Petroleum',
-                        'Lagged_MaxAQI'] + \
-                       all_wind_dir_columns
+                        'Lagged_MaxAQI'] + all_wind_dir_columns
 
         target = ['MaxAQI']
 
         # Fill NaN values in the one-hot encoded wind direction columns with 0s
         df[all_wind_dir_columns] = df[all_wind_dir_columns].fillna(0)
 
-        # Handle missing values (using ffill for the main DataFrame)
+        # Handle missing values (using ffill)
         df.ffill(inplace=True)
 
-        # Directly use the provided list of selected features
-        features = ['traffic','temperature', 'humidity', 'wind_speed', 'pressure', 'precip', 'visibility', 'Canada',
-                    'Central America', 'USA', 'Other', 'Petroleum', 'Lagged_MaxAQI']
+        # Selected Features
+        features = ['traffic', 'temperature', 'humidity', 'wind_speed', 'pressure', 'precip', 'visibility', 'Canada',
+                    'Central America', 'USA', 'Other', 'Petroleum', 'Lagged_MaxAQI'] + all_wind_dir_columns
 
         # 2. Prepare sequences for LSTM
-        def create_sequences(dataset, lookback):
+        def create_sequences(dataset, lookback, target_index):
             X, y = [], []
             for i in range(len(dataset) - lookback - 1):
                 X.append(dataset[i:(i + lookback), :])
-                y.append(dataset[i + lookback, -1])
-
+                y.append(dataset[i + lookback, target_index])  # Use target_index
             return np.array(X), np.array(y)
 
         lookback = 4
-        X, y = create_sequences(df[features].values, lookback)
+
+        # Find the index of 'MaxAQI' for use in create_sequences
+        target_index = df.columns.get_loc('MaxAQI')
+
+        X, y = create_sequences(df[features + ['MaxAQI']].values, lookback, target_index) # Include MaxAQI in the input
+        y = y.reshape(-1, 1)  # Ensure y is 2D
+
 
         # 3. Build and train multiple LSTM models (Ensemble) with TimeSeriesSplit
-        n_models = 1
+        n_models = 6
         ensemble_predictions = []
         batch_size = 64
         histories = []
         tscv = TimeSeriesSplit(n_splits=5)
+        all_fold_predictions = [] # Store predictions for each fold
+        all_fold_actuals = []
 
-        for i, (train_index, test_index) in enumerate(tscv.split(X)):
+        for fold, (train_index, test_index) in enumerate(tscv.split(X)):
+            print(f"Fold {fold+1}")
             X_train, X_test = X[train_index], X[test_index]
             y_train, y_test = y[train_index], y[test_index]
 
+            fold_predictions = [] # Predictions for THIS fold
             for i in range(n_models):
                 model = Sequential()
+                model.add(LSTM(50 + i * 10, return_sequences=True, kernel_regularizer=l2(0.5), input_shape=(lookback, len(features))))
+                model.add(Dropout(0.2))
                 model.add(LSTM(50 + i * 10, return_sequences=True, kernel_regularizer=l2(0.5)))
                 model.add(Dropout(0.2))
-                model.add(LSTM(50 + i * 10, return_sequences=True))
-                model.add(Dropout(0.2))
-                model.add(LSTM(50 + i * 10, return_sequences=True))
-                model.add(LSTM(50 + i * 10, return_sequences=True))
-                model.add(LSTM(50 + i * 10))
+                model.add(LSTM(50 + i * 10, return_sequences=True, kernel_regularizer=l2(0.5)))
+                model.add(LSTM(50 + i * 10, return_sequences=True, kernel_regularizer=l2(0.5)))
+                model.add(LSTM(50 + i * 10, kernel_regularizer=l2(0.5)))
                 model.add(Dense(1))
 
-                # Compile the model after defining its architecture with a new optimizer each time
+                # Compile the model
                 model.compile(loss='mean_squared_error', optimizer=tf.keras.optimizers.Adam())
-
-                model.build(input_shape=(batch_size, lookback, len(features)))
 
                 # Add early stopping
                 early_stop = EarlyStopping(monitor='val_loss', patience=25)
 
                 history = model.fit(X_train, y_train, epochs=80, batch_size=batch_size, validation_data=(X_test, y_test),
-                                    callbacks=[early_stop])
+                                    callbacks=[early_stop], verbose=0)
                 histories.append(history)
 
-                # 5. Make predictions for the next 3 days (for each model)
 
-                # Prepare the input data
-                # Re-download the master dataset to get the latest data
-                blob = master_dataset_bucket.blob('master_dataset.csv')
-                blob.download_to_filename('/tmp/latest_master_dataset.csv')
+                # Prediction for THIS fold
+                last_sequence = X_test[-1].reshape(1, lookback, len(features)) # Use the LAST sequence of the TEST set
+                model_preds = []
+                for _ in range(3): # Predict 3 days
+                    next_pred = model.predict(last_sequence, verbose=0)[0, 0]  # Predict, get single value
+                    model_preds.append(next_pred)
+                    # Update sequence:  Remove oldest, add new prediction, reshape
+                    new_row = np.concatenate([last_sequence[0, 1:, :], [[next_pred] + [0] * (len(features) -1 )]], axis=0)  # Add prediction + padding
+                    last_sequence = new_row.reshape(1, lookback, len(features))
 
-                # Load the latest data
-                latest_data = pd.read_csv('/tmp/latest_master_dataset.csv')
+                fold_predictions.append(model_preds)
 
-                # Preprocess the latest data
-                latest_data['Date'] = pd.to_datetime(latest_data['Date'], format='%m/%d/%Y')
-                latest_data.set_index('Date', inplace=True)
 
-                # One-hot encode 'wind_dir' on the LATEST data
-                latest_data = pd.get_dummies(latest_data, columns=['wind_dir'], prefix='wind_dir')
+            # Average predictions for the fold
+            avg_fold_preds = np.mean(fold_predictions, axis=0)
+            all_fold_predictions.append(avg_fold_preds)
+            all_fold_actuals.append(y_test[-3:]) 
 
-                # Align the columns
-                for col in all_wind_dir_columns:
-                    if col not in latest_data.columns:
-                        latest_data[col] = 0
-                latest_data = latest_data[
-                    all_wind_dir_columns + [col for col in features if col not in all_wind_dir_columns]]
+        # Combine Predictions and Actuals
+        # Flatten the lists of predictions and actuals
+        all_fold_predictions = np.concatenate(all_fold_predictions)
+        all_fold_actuals = np.concatenate(all_fold_actuals)
 
-                # Fill missing values using ffill()
-                latest_data.ffill(inplace=True)
+        # Calculate overall MSE and RMSE
+        mse_original_scale = mean_squared_error(all_fold_actuals, all_fold_predictions)
+        print("Overall MSE:", mse_original_scale)
+        print("Overall RMSE:", np.sqrt(mse_original_scale))
 
-                # After applying ffill to the latest_data
-                pd.set_option('display.max_columns', None)
-                print(latest_data.tail(3))
+        # Final Prediction
+        # After cross-validation, train on the ENTIRE dataset for the final prediction
+        final_ensemble_predictions = []
+        for i in range(n_models):
+            final_model = Sequential()
+            final_model.add(LSTM(50 + i * 10, return_sequences=True, kernel_regularizer=l2(0.5), input_shape=(lookback, len(features))))
+            final_model.add(Dropout(0.2))
+            final_model.add(LSTM(50 + i * 10, return_sequences=True, kernel_regularizer=l2(0.5)))
+            final_model.add(Dropout(0.2))
+            final_model.add(LSTM(50 + i * 10, return_sequences=True, kernel_regularizer=l2(0.5)))
+            final_model.add(LSTM(50 + i * 10, return_sequences=True, kernel_regularizer=l2(0.5)))
+            final_model.add(LSTM(50 + i * 10, kernel_regularizer=l2(0.5)))
+            final_model.add(Dense(1))
+            final_model.compile(loss='mean_squared_error', optimizer=tf.keras.optimizers.Adam())
+            final_model.fit(X, y, epochs=80, batch_size=batch_size, callbacks=[early_stop], verbose=0) # Use the whole dataset (X, y)
 
-                # Create sequences for prediction
-                last_sequence = latest_data[features].values[-lookback:]
+            # Prepare the input data for final prediction
+            last_sequence_final = df[features].values[-lookback:].reshape(1, lookback, len(features))
+            final_model_preds = []
+            for _ in range(3):
+                next_pred_final = final_model.predict(last_sequence_final, verbose=0)[0, 0]
+                final_model_preds.append(next_pred_final)
+                # Update the sequence
+                new_row_final = np.concatenate([last_sequence_final[0, 1:, :], [[next_pred_final] + [0] * (len(features) - 1)]], axis=0) #padding
+                last_sequence_final = new_row_final.reshape(1, lookback, len(features))
 
-                prediction_sequences = []
-                for k in range(3):
-                    next_pred = model.predict(last_sequence.reshape(1, lookback, len(features)))
-                    prediction_sequences.append(next_pred[0, 0])
+            final_ensemble_predictions.append(final_model_preds)
 
-                    next_pred_reshaped = next_pred.reshape(-1)
+        final_predictions = np.mean(final_ensemble_predictions, axis=0)
 
-                    # Update the last sequence for the next prediction
-                    last_sequence = np.vstack([last_sequence[1:], np.hstack([next_pred_reshaped, last_sequence[-1, 1:]])])
 
-                predictions = np.array(prediction_sequences)
+        # Output and Save Predictions
+        future_dates = pd.date_range(start=df.index[-1] + pd.Timedelta(days=1), periods=3)
+        for date, pred in zip(future_dates, final_predictions):
+            print(f'Predicted AQI for {date.strftime("%m/%d/%Y")}: {pred}')
 
-                ensemble_predictions.append(predictions)
-
-            # Average the predictions from all models in the ensemble
-            final_predictions = np.mean(ensemble_predictions, axis=0)
-
-            # Print the predictions
-            future_dates = pd.date_range(start=df.index[-1] + pd.Timedelta(days=1), periods=3)
-            for date, pred in zip(future_dates, final_predictions):
-                print(f'Predicted AQI for {date.strftime("%m/%d/%Y")}: {pred}')
-
-        # Create a DataFrame for predictions (outside the cross-validation loop)
         predictions_df = pd.DataFrame({'Date': future_dates, 'Predicted AQI': final_predictions})
-
         blob = forecast_dataset_bucket.blob('aqi_forecast_test.csv')
         blob.upload_from_string(predictions_df.to_csv(index=False), content_type='text/csv')
         print("Predictions saved to aqi_forecast.csv in columbus-forecast-bucket")
@@ -176,10 +184,7 @@ def run_LSTM():
         # Print predictions
         print("Predictions:", final_predictions)
 
-        # Calculate MSE and RMSE using the last fold's test set
-        mse_original_scale = mean_squared_error(y_test[-3:], final_predictions)
-        print("MSE:", mse_original_scale)
-        print("RMSE:", np.sqrt(mse_original_scale))
+
 
     except Exception as e:
         print(f"An error occurred: {e}")
